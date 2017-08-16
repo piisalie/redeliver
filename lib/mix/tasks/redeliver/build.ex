@@ -2,11 +2,16 @@ defmodule Mix.Tasks.Redeliver.Build do
   require Logger
   use Mix.Task
 
+  # todo
+  # actual config
+  # copy build script from rel to build server
+  # return built release (configurable)
+
   @shortdoc "Build a release on the build server"
 
-  @build_server ""
+  @build_server "104.236.58.163"
   @build_user   "app"
-  @git_branch   "master"
+  @git_branch   "pd_redeliver"
   @timeout      5_000
 
   def run(_args) do
@@ -26,6 +31,9 @@ defmodule Mix.Tasks.Redeliver.Build do
          {:ok, channel}             <- :ssh_connection.session_channel(connection, @timeout),
          :success                   <- unpack_archive(connection, channel, tarball),
          :ok                        <- wait_for_closed_message(connection, channel),
+         {:ok, channel}             <- :ssh_connection.session_channel(connection, @timeout),
+         :success                   <- run_build_command(connection, channel, directory),
+         :ok                        <- test(connection, channel),
          :ok                        <- :ssh.close(connection),
       do: :ok
   end
@@ -92,12 +100,46 @@ defmodule Mix.Tasks.Redeliver.Build do
     )
   end
 
+  defp run_build_command(connection, channel, remote_file) do
+    Logger.info "Running build commands in: #{remote_file}"
+    :ssh_connection.exec(
+      connection,
+      channel,
+      to_charlist("./build.sh #{remote_file}"),
+      @timeout
+    )
+  end
+
+  def test(connection, channel) do
+    Stream.unfold({connection, channel}, fn {conn, chan} ->
+      recv(conn,chan)
+    end)
+    |> Stream.run
+  end
+
+  defp recv(conn, chan) do
+    receive do
+      {:ssh_cm, ^conn, {:closed, ^chan}} ->
+        {:ok, {conn, chan}}
+      {:ssh_cm, ^conn, message} ->
+        case message do
+          {:data, _, _, output} ->
+            IO.puts output
+            recv(conn, chan)
+          {:eof, _} ->
+            nil
+          _ ->
+            recv(conn, chan)
+        end
+    end
+  end
+
   defp wait_for_closed_message(connection, channel) do
     Stream.unfold({connection, channel}, fn {conn, chan} ->
       receive do
         {:ssh_cm, ^conn, {:closed, ^chan}} ->
           {:ok, {conn, chan}}
-        {:ssh_cm, ^conn, _message} ->
+        {:ssh_cm, ^conn, message} ->
           nil
       end
     end)
