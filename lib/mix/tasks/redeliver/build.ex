@@ -1,11 +1,15 @@
 defmodule Mix.Tasks.Redeliver.Build do
   require Logger
+  require Record
+  Record.defrecord(:file_info, Record.extract(:file_info, from_lib: "kernel/include/file.hrl"))
   use Mix.Task
 
-  # todo
-  # actual config
-  # copy build script from rel to build server
-  # return built release (configurable)
+  # Todo:
+  # - [x] copy build script from rel to build server
+  # - [ ] return built release (configurable)
+  # - [ ] hanabi_umbrella/_build/prod/rel/hanabi_umbrella/releases/${vsn}/#{tarball}
+  # - [ ] actual config
+  # - [ ] handle multiple people using same build server
 
   @shortdoc "Build a release on the build server"
 
@@ -27,13 +31,14 @@ defmodule Mix.Tasks.Redeliver.Build do
          stream                     <- unfold_stream(port),
          _data                      <- write_data(channel, stream, remote_file),
          :ok                        <- :ssh_sftp.close(channel, remote_file, @timeout),
+         :ok                        <- write_build_script(channel, "build", "rel/build.sh", @timeout),
          :ok                        <- :ssh_sftp.stop_channel(channel),
          {:ok, channel}             <- :ssh_connection.session_channel(connection, @timeout),
          :success                   <- unpack_archive(connection, channel, tarball),
-         :ok                        <- wait_for_closed_message(connection, channel),
+         :ok                        <- listen_for_messages(connection, channel),
          {:ok, channel}             <- :ssh_connection.session_channel(connection, @timeout),
          :success                   <- run_build_command(connection, channel, directory),
-         :ok                        <- test(connection, channel),
+         :ok                        <- listen_for_messages(connection, channel),
          :ok                        <- :ssh.close(connection),
       do: :ok
   end
@@ -105,12 +110,12 @@ defmodule Mix.Tasks.Redeliver.Build do
     :ssh_connection.exec(
       connection,
       channel,
-      to_charlist("./build.sh #{remote_file}"),
+      to_charlist("./build #{remote_file}"),
       @timeout
     )
   end
 
-  def test(connection, channel) do
+  def listen_for_messages(connection, channel) do
     Stream.unfold({connection, channel}, fn {conn, chan} ->
       recv(conn,chan)
     end)
@@ -124,7 +129,7 @@ defmodule Mix.Tasks.Redeliver.Build do
       {:ssh_cm, ^conn, message} ->
         case message do
           {:data, _, _, output} ->
-            IO.puts output
+            IO.puts(String.trim(output))
             recv(conn, chan)
           {:eof, _} ->
             nil
@@ -134,16 +139,15 @@ defmodule Mix.Tasks.Redeliver.Build do
     end
   end
 
-  defp wait_for_closed_message(connection, channel) do
-    Stream.unfold({connection, channel}, fn {conn, chan} ->
-      receive do
-        {:ssh_cm, ^conn, {:closed, ^chan}} ->
-          {:ok, {conn, chan}}
-        {:ssh_cm, ^conn, message} ->
-          nil
-      end
-    end)
-    |> Stream.run
+  defp write_build_script(channel, name, source, timeout) do
+    Logger.info "Copying build script"
+    with {:ok, contents}    <- File.read(source),
+         {:ok, remote_file} <- open_remote_file(channel, name),
+         {:ok, info}        <- :ssh_sftp.read_file_info(channel, name),
+         :ok                <- :ssh_sftp.write_file_info(channel, name, file_info(info, mode: 0o755)),
+         :ok                <- :ssh_sftp.write(channel, remote_file, contents, timeout),
+         :ok                <- :ssh_sftp.close(channel, remote_file, timeout),
+    do: :ok
   end
 end
 
